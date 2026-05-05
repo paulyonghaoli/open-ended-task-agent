@@ -1,0 +1,2 @@
+# This repository has no mandatory runtime dependencies beyond Python 3.10+.
+# Use pyproject.toml or requirements-dev.txt for local setup.

@@ -1,0 +1,16 @@
+.venv/
+.python-embed/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+*.env
+.env
+.DS_Store

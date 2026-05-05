@@ -1,0 +1,25 @@
+[project]
+name = "open-ended-task-agent"
+version = "0.1.0"
+description = "Compact demo of a higher-agency task agent with planning, tool selection, observation, and safe termination."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+license = "MIT"
+keywords = ["agent", "planning", "tooling", "demo", "local-corpus"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+llm = ["openai>=1.0", "python-dotenv>=1.0"]
+web = ["fastapi>=0.100", "uvicorn>=0.24"]
+
+[project.scripts]
+task-agent = "task_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["task_agent*"]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
