@@ -2,20 +2,32 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from .ledger import TaskLedger
+    from .router import RoutingDecision
+    from .time_state import TimeState
+    from .verifier import VerificationReport
 
 
 class TraceEventType:
     GOAL_RECEIVED = "GOAL_RECEIVED"
     PLAN_CREATED = "PLAN_CREATED"
+    ROUTING_DECIDED = "ROUTING_DECIDED"
     REASONING = "REASONING"
     ACTION_SELECTED = "ACTION_SELECTED"
     TOOL_CALLED = "TOOL_CALLED"
     OBSERVATION_RECORDED = "OBSERVATION_RECORDED"
+    SYMBOLIC_COMPUTED = "SYMBOLIC_COMPUTED"
     REFLECTION_LOGGED = "REFLECTION_LOGGED"
     EVIDENCE_GAP_DETECTED = "EVIDENCE_GAP_DETECTED"
     REPLAN_TRIGGERED = "REPLAN_TRIGGERED"
     CONFIDENCE_UPDATED = "CONFIDENCE_UPDATED"
+    VERIFICATION_LOGGED = "VERIFICATION_LOGGED"
+    IDLE_DETECTED = "IDLE_DETECTED"
+    CHECKPOINT_CREATED = "CHECKPOINT_CREATED"
+    STALL_DETECTED = "STALL_DETECTED"
     TERMINATED_SUCCESS = "TERMINATED_SUCCESS"
     TERMINATED_PARTIAL = "TERMINATED_PARTIAL"
     TERMINATED_FAILED = "TERMINATED_FAILED"
@@ -70,6 +82,11 @@ class AgentState:
     unsupported: bool = False
     no_progress_count: int = 0
     evidence_quality: float = 0.0
+    # Cognitive subsystem attachments (all optional, populated by run_agent)
+    time_state: Optional[TimeState] = None
+    ledger: Optional[TaskLedger] = None
+    routing: Optional[RoutingDecision] = None
+    verifier_report: Optional[VerificationReport] = None
 
     def log_event(
         self,

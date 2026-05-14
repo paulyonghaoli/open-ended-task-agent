@@ -14,3 +14,10 @@ htmlcov/
 *.env
 .env
 .DS_Store
+plan.md
+.gitignore
+.claude/
+.oeta_memory/
+.oeta_sleep/
+open_ended_task_agent.egg-info/
+eval_results.json

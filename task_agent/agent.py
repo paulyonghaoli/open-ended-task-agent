@@ -18,15 +18,20 @@ References:
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .config import DEFAULT_MAX_STEPS, LLM_REASON_MAX_TOKENS, REPLAN_LIMIT
 from .knowledge import KnowledgeGraph
+from .ledger import TaskLedger
 from .llm import is_openai_available, safe_generate
 from .planner import generate_plan
 from .reflection import reflect
+from .router import route_reasoning_mode
 from .state import AgentPlan, AgentState, PlanStep, TraceEventType
+from .symbolic import count_characters, factorial, n_choose_k, safe_arithmetic_eval
 from .termination import should_terminate, termination_summary
+from .time_state import TimeState
 from .tool_selector import choose_next_action
 from .tools import (
     KnowledgeGraph,
@@ -38,6 +43,7 @@ from .tools import (
     summarize_findings,
     compare_items,
 )
+from .verifier import verify_state
 
 _REASON_SYSTEM = "You are a reasoning agent. Think step by step. Be concise."
 _REASON_PROMPT = """\
@@ -81,6 +87,50 @@ def _make_summarize_step(step_id: int, goal: str) -> PlanStep:
     )
 
 
+# ── Symbolic dispatch ──────────────────────────────────────────────────────────
+
+def _dispatch_symbolic(goal: str) -> dict[str, Any]:
+    """Route a natural-language symbolic goal to the appropriate pure function."""
+    text = goal.strip()
+
+    # 1. Character count: "count <char> in <word>"
+    m = re.search(
+        r"count\s+(?:the\s+)?(?:number\s+of\s+)?([a-zA-Z])\s+in\s+(\w+)",
+        text, re.I,
+    )
+    if m:
+        return count_characters(m.group(2), m.group(1))
+
+    # 2. "how many <char>(s) in <word>"
+    m = re.search(
+        r"how\s+many\s+([a-zA-Z])[s']?\s+(?:are\s+(?:in|there\s+in)|in)\s+(\w+)",
+        text, re.I,
+    )
+    if m:
+        return count_characters(m.group(2), m.group(1))
+
+    # 3. Factorial: "5!" or "factorial of 5"
+    m = re.search(r"(\d+)\s*!", text) or re.search(
+        r"factorial\s+(?:of\s+)?(\d+)", text, re.I
+    )
+    if m:
+        return factorial(int(m.group(1)))
+
+    # 4. C(n, k) combinations
+    m = re.search(r"[Cc]\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", text)
+    if m:
+        return n_choose_k(int(m.group(1)), int(m.group(2)))
+
+    # 5. Arithmetic expression
+    m = re.search(r"[\d][\d\+\-\*\/\^\(\)\.\s]+[\d\)]", text)
+    if m:
+        expr = m.group(0).strip().replace("^", "**")
+        if any(c in expr for c in "+-*/"):
+            return safe_arithmetic_eval(expr)
+
+    return {"success": False, "reason": "could not parse symbolic task from goal"}
+
+
 # ── Reasoning step (ReAct: Thought) ───────────────────────────────────────────
 
 def _reason(current: PlanStep, state: AgentState) -> str:
@@ -112,7 +162,37 @@ def _reason(current: PlanStep, state: AgentState) -> str:
 def _execute_step(
     current: PlanStep, state: AgentState, corpus: KnowledgeGraph
 ) -> dict[str, Any]:
-    # ── search ──────────────────────────────────────────────────────────────────
+    # ── symbolic ─────────────────────────────────────────────────────────────
+    if current.action_type == "symbolic":
+        result_data = _dispatch_symbolic(current.target)
+        state.tool_calls.append(
+            {
+                "tool": "symbolic",
+                "target": current.target,
+                "success": result_data.get("success", False),
+            }
+        )
+        if result_data.get("success"):
+            summary = result_data.get("result") or str(result_data.get("expression", ""))
+            state.observations.append({"source": "symbolic", "summary": summary})
+            # Symbolic results are deterministic — always high confidence
+            state.evidence_quality = 1.0
+            state.confidence = "high"
+            state.log_event(
+                TraceEventType.SYMBOLIC_COMPUTED,
+                tool_name="symbolic",
+                reason=summary,
+                metadata=result_data,
+            )
+            state.log_event(
+                TraceEventType.OBSERVATION_RECORDED,
+                reason="Symbolic computation result recorded",
+                metadata={"result": summary},
+            )
+            return {"success": True, "tool": "symbolic", "output": result_data}
+        return {"success": False, "tool": "symbolic", "reason": result_data.get("reason")}
+
+    # ── search ────────────────────────────────────────────────────────────────
     if current.action_type == "search":
         results = search_local_corpus(current.target, corpus)
         state.tool_calls.append(
@@ -137,6 +217,10 @@ def _execute_step(
                     "top_score": results[0].get("score", 0) if results else 0,
                 },
             )
+            if state.ledger is not None:
+                state.ledger.record_fact(
+                    f"Found {len(results)} passage(s) about '{current.target}'"
+                )
             return {"success": True, "tool": "local_search", "output": results}
 
         # No hits — attempt one refinement
@@ -151,12 +235,16 @@ def _execute_step(
                 reason="search returned no hits",
                 metadata={"refined_target": refined, "replan_count": state.replan_count},
             )
+            if state.ledger is not None:
+                state.ledger.record_failure(
+                    f"Search for '{current.target}' returned no results"
+                )
             return {"success": False, "tool": "local_search", "reason": "no_hits", "replan": True}
 
         state.unsupported = True
         return {"success": False, "tool": "local_search", "reason": "no_hits_exhausted"}
 
-    # ── compare ─────────────────────────────────────────────────────────────────
+    # ── compare ───────────────────────────────────────────────────────────────
     if current.action_type == "compare":
         targets = _parse_targets(current.target)
         result = llm_compare(targets, state.observations, state.goal)
@@ -173,6 +261,10 @@ def _execute_step(
                 reason="Comparison matrix recorded",
                 metadata={"winner": result.get("winner"), "confidence": result.get("confidence")},
             )
+            if state.ledger is not None:
+                state.ledger.record_fact(
+                    f"Comparison complete; recommended: {result.get('winner', 'unknown')}"
+                )
             return {"success": True, "tool": "compare_items", "output": result}
 
         # Comparison failed — replan with fallback search
@@ -200,7 +292,7 @@ def _execute_step(
             }
         return {"success": False, "tool": "compare_items", "reason": "insufficient_evidence"}
 
-    # ── summarize ───────────────────────────────────────────────────────────────
+    # ── summarize ─────────────────────────────────────────────────────────────
     if current.action_type == "summarize":
         summary = llm_summarize(state.goal, state.observations, state.confidence)
         state.final_answer = summary["final"]
@@ -211,7 +303,7 @@ def _execute_step(
         )
         return {"success": True, "tool": "summarize_findings", "output": summary}
 
-    # ── calculate ────────────────────────────────────────────────────────────────
+    # ── calculate ─────────────────────────────────────────────────────────────
     if current.action_type == "calculate":
         result = calculator(current.target)
         state.tool_calls.append(
@@ -229,7 +321,11 @@ def _execute_step(
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
-def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
+def run_agent(
+    goal: str,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    enable_memory: bool = False,
+) -> AgentState:
     """
     Execute the ReAct+Reflexion agent loop for a given goal.
 
@@ -242,10 +338,25 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
     plan = generate_plan(goal, corpus.document_keys())
 
     state = AgentState(goal=goal, plan=plan, pending_steps=list(plan.steps))
+
+    # Attach cognitive subsystems
+    routing = route_reasoning_mode(goal)
+    state.routing = routing
+    state.time_state = TimeState()
+    state.ledger = TaskLedger(
+        goal=goal,
+        subgoals=[s.description for s in plan.steps],
+    )
+
     state.log_event(
         TraceEventType.GOAL_RECEIVED,
         reason="Goal accepted for planning",
         metadata={"goal": goal},
+    )
+    state.log_event(
+        TraceEventType.ROUTING_DECIDED,
+        reason=routing.rationale,
+        metadata=routing.to_dict(),
     )
     state.log_event(
         TraceEventType.PLAN_CREATED,
@@ -274,13 +385,16 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
                 state.unsupported = True
                 break
 
-        # ── 1. Select action ─────────────────────────────────────────────────────
+        # ── 1. Select action ──────────────────────────────────────────────────
         current = choose_next_action(state)
         if current in state.pending_steps:
             state.pending_steps.remove(current)
         state.step_count += 1
 
-        # ── 2. Reason (ReAct: Thought) ──────────────────────────────────────────
+        if state.time_state is not None:
+            state.time_state.update_progress()
+
+        # ── 2. Reason (ReAct: Thought) ────────────────────────────────────────
         thought = _reason(current, state)
         state.reasoning_log.append(thought)
         state.log_event(
@@ -290,7 +404,6 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
             metadata={"step": state.step_count, "target": current.target},
         )
 
-        # Log the action selection
         state.log_event(
             TraceEventType.ACTION_SELECTED,
             tool_name=current.action_type,
@@ -298,7 +411,7 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
             metadata={"target": current.target, "rationale": current.rationale},
         )
 
-        # ── 3. Execute tool (ReAct: Act + Observe) ──────────────────────────────
+        # ── 3. Execute tool (ReAct: Act + Observe) ───────────────────────────
         result = _execute_step(current, state, corpus)
         state.log_event(
             TraceEventType.TOOL_CALLED,
@@ -310,15 +423,9 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
             },
         )
 
-        # ── 4. Reflect (Reflexion: assess + gap-detect) ─────────────────────────
-        if current.action_type != "summarize":
+        # ── 4. Reflect (Reflexion: assess + gap-detect) ───────────────────────
+        if current.action_type not in ("summarize", "symbolic"):
             reflection = reflect(state, result)
-            # Only trigger gap-driven replan when:
-            #  (a) reflection signals a gap
-            #  (b) budget allows
-            #  (c) last result succeeded (no point re-searching after failure)
-            #  (d) there are NO more search steps already in the pending queue
-            #      (the plan may already address the gap)
             pending_searches = [
                 s for s in state.pending_steps if s.action_type == "search"
             ]
@@ -328,7 +435,6 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
                 and result.get("success")
                 and not pending_searches
             ):
-                # Use the goal as the gap query, not the generic gap description
                 gap_query = state.goal
                 state.replan_count += 1
                 state.pending_steps.insert(
@@ -345,7 +451,7 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
                     metadata={"replan_count": state.replan_count},
                 )
 
-        # ── 5. Update progress counters ─────────────────────────────────────────
+        # ── 5. Update progress counters ───────────────────────────────────────
         if result.get("success"):
             state.completed_steps.append(current)
             state.no_progress_count = 0
@@ -353,7 +459,7 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
             state.failures += 1
             state.no_progress_count += 1
 
-        # ── 6. Check termination ────────────────────────────────────────────────
+        # ── 6. Check termination ──────────────────────────────────────────────
         stop, event_type = should_terminate(state, max_steps=max_steps)
         if stop:
             state.log_event(
@@ -361,6 +467,8 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
                 reason=event_type,
                 metadata=termination_summary(state),
             )
+            if state.ledger is not None:
+                state.ledger.close(reason=event_type)
             break
 
     # ── Fallback answer ─────────────────────────────────────────────────────────
@@ -376,5 +484,21 @@ def run_agent(goal: str, max_steps: int = DEFAULT_MAX_STEPS) -> AgentState:
         state.confidence = state.confidence if state.confidence != "unknown" else "low"
         if state.sufficiency_status == "unknown":
             state.sufficiency_status = "insufficient"
+
+    # ── Post-loop: verifier ─────────────────────────────────────────────────────
+    verifier_report = verify_state(state)
+    state.verifier_report = verifier_report
+    state.log_event(
+        TraceEventType.VERIFICATION_LOGGED,
+        reason="passed" if verifier_report.passed else f"{len(verifier_report.issues)} issue(s) found",
+        metadata=verifier_report.to_dict(),
+    )
+    if verifier_report.confidence_adjustment < 0 and state.confidence == "high":
+        state.confidence = "medium"
+
+    # ── Optional memory persistence ─────────────────────────────────────────────
+    if enable_memory:
+        from .memory import EpisodeMemoryStore
+        EpisodeMemoryStore().append_episode(state)
 
     return state

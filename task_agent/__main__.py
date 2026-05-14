@@ -5,6 +5,8 @@ Usage:
     python -m task_agent "Compare DuckDB and SQLite for a local analytics app"
     python -m task_agent --steps 12 "Research LangGraph vs AutoGen"
     python -m task_agent --no-trace "Create a study plan for learning ROS2"
+    python -m task_agent --json "Count the number of r in strawberry"
+    python -m task_agent --memory "Compare FastAPI and Flask"
 
 Colour output is enabled automatically when the terminal supports it.
 Falls back to plain ASCII when stdout is not a TTY or encoding is limited.
@@ -12,10 +14,12 @@ Falls back to plain ASCII when stdout is not a TTY or encoding is limited.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import textwrap
 
 from .agent import run_agent
+from .export import export_state
 from .termination import termination_summary
 from .trace import format_trace_line
 
@@ -151,6 +155,31 @@ def _print_stats(state) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def _print_routing(state) -> None:
+    if state.routing is None:
+        return
+    r = state.routing
+    _print_section("ROUTING DECISION", _CYAN)
+    print(f"\n  Mode       : {_c(_BOLD, r.selected_mode.value.upper())}")
+    print(f"  Confidence : {r.confidence:.0%}")
+    print(f"  Rationale  : {_c(_DIM, r.rationale)}")
+
+
+def _print_verifier(state) -> None:
+    if state.verifier_report is None:
+        return
+    vr = state.verifier_report
+    if vr.passed:
+        return
+    _print_section("VERIFIER WARNINGS", _YELLOW)
+    for issue in vr.issues:
+        print(f"\n  - {_c(_YELLOW, issue)}")
+    for gap in vr.missing_evidence:
+        print(f"  Missing: {_c(_DIM, gap)}")
+    if vr.contradiction_risk > 0:
+        print(f"  Contradiction risk: {vr.contradiction_risk:.0%}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="task-agent",
@@ -164,6 +193,12 @@ def main() -> None:
     parser.add_argument(
         "--no-reflect", action="store_true", help="Suppress reflection output."
     )
+    parser.add_argument(
+        "--json", action="store_true", help="Output full state as JSON instead of formatted text."
+    )
+    parser.add_argument(
+        "--memory", action="store_true", help="Persist this run to .oeta_memory/."
+    )
     args = parser.parse_args()
 
     if not args.goal:
@@ -174,17 +209,27 @@ def main() -> None:
     kwargs: dict = {}
     if args.steps:
         kwargs["max_steps"] = args.steps
+    if args.memory:
+        kwargs["enable_memory"] = True
 
-    _print_header("OPEN-ENDED TASK AGENT")
-    print(f"\n  {_c(_BOLD, 'Goal:')} {goal}\n")
+    if not args.json:
+        _print_header("OPEN-ENDED TASK AGENT")
+        print(f"\n  {_c(_BOLD, 'Goal:')} {goal}\n")
 
     state = run_agent(goal, **kwargs)
 
+    if args.json:
+        print(json.dumps(export_state(state), indent=2, default=str))
+        return
+
+    _print_routing(state)
     _print_final_answer(state)
     _print_evidence(state)
 
     if not args.no_reflect:
         _print_reflections(state)
+
+    _print_verifier(state)
 
     if not args.no_trace:
         _print_trace(state)

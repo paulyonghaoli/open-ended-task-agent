@@ -21,14 +21,16 @@ from .config import LLM_MODEL, LLM_PLAN_MAX_TOKENS
 from .llm import is_openai_available, safe_generate
 from .state import AgentPlan, PlanStep
 
-TOOL_ACTIONS = ["search", "compare", "summarize", "calculate"]
+TOOL_ACTIONS = ["search", "compare", "summarize", "calculate", "symbolic"]
 
 _PLAN_SYSTEM = (
     "You are a task-planning agent that decomposes user goals into a short, "
-    "ordered action plan. You have access to exactly four tools: "
+    "ordered action plan. You have access to exactly five tools: "
     "search (retrieves local documents), compare (compares candidates using "
     "gathered evidence), summarize (synthesizes evidence into a final answer), "
-    "calculate (numeric comparisons). Think step by step before writing the plan."
+    "calculate (numeric comparisons), symbolic (deterministic character counting "
+    "or arithmetic — use for 'count X in Y' or math expression goals). "
+    "Think step by step before writing the plan."
 )
 
 _PLAN_PROMPT = """\
@@ -36,7 +38,7 @@ Goal: {goal}
 Available local documents: {titles}
 
 Step 1 — Think: What information is needed to answer this goal?
-Step 2 — Plan: Write a numbered action plan using ONLY the tools: search, compare, summarize, calculate.
+Step 2 — Plan: Write a numbered action plan using ONLY the tools: search, compare, summarize, calculate, symbolic.
          Format each line as:  N. <action> "<target or query>"
          Include 2–4 steps. End with a summarize step.
 
@@ -85,10 +87,20 @@ def _expected_evidence(action: str) -> str:
         "compare": "structured multi-criteria comparison of candidates",
         "summarize": "final answer with confidence note and source citations",
         "calculate": "numeric result supporting the comparison",
+        "symbolic": "exact deterministic result (character count or arithmetic value)",
     }.get(action, "supporting evidence")
 
 
 # ── Deterministic fallback ─────────────────────────────────────────────────────
+
+_SYMBOLIC_RE = re.compile(
+    r"(?:"
+    r"count\s+(?:the\s+)?(?:number\s+of\s+)?(\w+)(?:\s+in\s+(\w+))?"
+    r"|how\s+many\s+\w+\s+(?:are\s+(?:in|there)|in)\s+\w+"
+    r"|(?:what\s+is\s+)?(?:\d+[\+\-\*/\^]\d+)"
+    r")",
+    re.I,
+)
 
 _COMPARE_RE = re.compile(
     r"compare\s+(.+?)\s+(?:and|vs\.?|versus)\s+(.+?)(?:\s+for\s+.+)?(?:[.?!]|$)",
@@ -118,6 +130,32 @@ def _parse_compare_goal(goal: str) -> tuple[list[str], bool]:
 
 def _create_fallback_plan(goal: str, corpus_keys: Iterable[str]) -> AgentPlan:
     corpus_list = list(corpus_keys)
+
+    # Symbolic tasks (counting, arithmetic) — no corpus needed
+    if _SYMBOLIC_RE.search(goal):
+        return AgentPlan(
+            steps=[
+                PlanStep(
+                    id=1,
+                    action_type="symbolic",
+                    description="Execute deterministic symbolic computation",
+                    target=goal,
+                    expected_evidence="exact numeric or character-count result",
+                    rationale="Goal requires deterministic computation, not retrieval",
+                ),
+                PlanStep(
+                    id=2,
+                    action_type="summarize",
+                    description="Wrap symbolic result in a final answer",
+                    target=goal,
+                    expected_evidence="concise answer with computed value",
+                    rationale="Deliver the exact result to the user",
+                ),
+            ],
+            stopping_criteria="Compute the exact symbolic answer and deliver it.",
+            notes="Deterministic symbolic-computation plan.",
+        )
+
     items, is_compare = _parse_compare_goal(goal)
 
     if is_compare and len(items) == 2:
