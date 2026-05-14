@@ -135,7 +135,8 @@ def test_agent_terminates_by_max_steps():
     state = run_agent("Compare DuckDB and SQLite for a local analytics app", max_steps=1)
     assert state.step_count == 1
     types = event_types(state)
-    assert types[-1] == TraceEventType.TERMINATED_MAX_STEPS
+    terminal = [t for t in types if t.startswith("TERMINATED_")]
+    assert terminal[-1] == TraceEventType.TERMINATED_MAX_STEPS
 
 
 def test_agent_respects_max_steps_budget():
@@ -151,9 +152,14 @@ def test_trace_first_event_is_goal_received():
     assert state.trace[0]["event_type"] == TraceEventType.GOAL_RECEIVED
 
 
-def test_trace_second_event_is_plan_created():
+def test_trace_second_event_is_routing_decided():
     state = run_agent("Compare DuckDB and SQLite for a local analytics app")
-    assert state.trace[1]["event_type"] == TraceEventType.PLAN_CREATED
+    assert state.trace[1]["event_type"] == TraceEventType.ROUTING_DECIDED
+
+
+def test_trace_third_event_is_plan_created():
+    state = run_agent("Compare DuckDB and SQLite for a local analytics app")
+    assert state.trace[2]["event_type"] == TraceEventType.PLAN_CREATED
 
 
 def test_trace_steps_are_sequential():
