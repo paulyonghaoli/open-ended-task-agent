@@ -477,9 +477,14 @@ def run_agent(
             fallback = summarize_findings(goal, state.observations, state.confidence)
             state.final_answer = fallback["final"]
         else:
+            # No observations — goal is outside corpus scope
+            topics = sorted(corpus.document_keys())
+            topics_str = ", ".join(topics) if topics else "(none loaded)"
             state.final_answer = (
-                "The agent could not produce an answer. "
-                "The goal may be outside the scope of the local knowledge corpus."
+                f"Goal: {goal}\n\n"
+                "No relevant evidence was found in the local knowledge corpus.\n\n"
+                f"Topics currently in scope: {topics_str}\n\n"
+                "Try rephrasing your goal around one of the available topics."
             )
         state.confidence = state.confidence if state.confidence != "unknown" else "low"
         if state.sufficiency_status == "unknown":
